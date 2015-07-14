@@ -26,14 +26,9 @@ import qualified Text.Read as Read
 import qualified Text.Regex as Regex
 
 {-
-sundial
-pendulum
-metronome
-crocodile
-
 timesheet files - one per week?
-store in ~/.timesheets
-store tasks in ~/.timesheets/task.txt
+store in ~/.todo/
+store tasks in ~/.todo/todo.txt
 
 commands
 list : show tasks via pager, like git log
@@ -102,9 +97,9 @@ dayformat = "%F"
 
 
 timeDir :: FilePath
-timeDir = "./"
+-- timeDir = "./"
 -- timeDir = "/c/Users/alistair/Documents/haskell/punchclock/"
--- timeDir = "/home/abayley/.todo/"
+timeDir = "/home/abayley/.todo/"
 
 -- taskFile = "~/.timesheets/tasks.txt"
 taskFile :: String
@@ -149,14 +144,17 @@ todoFilePath = do
 -}
 
 -- construct a ZonedTime from the current day plus user-supplied time
-makeUserTime :: String -> IO LocalTime.ZonedTime
+makeUserTime :: String -> IO (Maybe LocalTime.ZonedTime)
 makeUserTime str = do
     now <- LocalTime.getZonedTime
-    let ds = List.filter Char.isDigit str
-    let mbTod = FormatTime.parseTimeM True FormatTime.defaultTimeLocale "%H%M" ds
-    let day = LocalTime.localDay (LocalTime.zonedTimeToLocalTime now)
-    let newZT = now { LocalTime.zonedTimeToLocalTime = LocalTime.LocalTime day (Maybe.fromJust mbTod) }
-    return (maybe now (const newZT) mbTod)
+    if List.null str
+    then return (Just now)
+    else do
+        let ds = List.filter Char.isDigit str
+        let mbTod = FormatTime.parseTimeM True FormatTime.defaultTimeLocale "%H%M" ds
+        let day = LocalTime.localDay (LocalTime.zonedTimeToLocalTime now)
+        let newZT = now { LocalTime.zonedTimeToLocalTime = LocalTime.LocalTime day (Maybe.fromJust mbTod) }
+        return (maybe Nothing (Just . const newZT) mbTod)
 
 
 timesheetStart :: Calendar.Day -> Calendar.Day
@@ -185,7 +183,8 @@ parseTime = FormatTime.parseTimeM True FormatTime.defaultTimeLocale timeformat
 parseTimeEvent :: Text.Text -> TimeEvent
 parseTimeEvent text =
     let fields = Text.splitOn (Text.pack "  ") text
-        (f1:f2:_) = fields
+        f1 = head fields
+        f2 = if List.length fields > 1 then fields !! 1 else Text.empty
         start = Maybe.fromJust (parseTime (Text.unpack f1))
     in (start, f2)
 
@@ -209,34 +208,37 @@ getTaskByPos tasks n = if n > 0 && n <= length tasks
     else Left ("No task matching: " ++ show n)
 
 
-getTaskByPosM :: [Text.Text] -> Int -> IO Text.Text
-getTaskByPosM tasks n = either fail return (getTaskByPos tasks n)
+--getTaskByPosM :: [Text.Text] -> Int -> Text.Text
+--getTaskByPosM tasks n = either fail return (getTaskByPos tasks n)
 
 
 -- If we don't find a matching task return the match text
-getTaskByToken :: [Text.Text] -> String -> Text.Text
-getTaskByToken tasks str =
-    Maybe.fromMaybe pstr (headMaybe matches)
-    where
-        pstr = Text.pack str
-        matches = List.filter (Text.isInfixOf pstr) tasks
+getTaskByToken :: [Text.Text] -> String -> Either String Text.Text
+getTaskByToken tasks str = maybe (Left ("No task matching: " ++ str)) Right
+        (headMaybe matches)
+    where matches = List.filter (Text.isInfixOf (Text.pack str)) tasks
 
 
 -- If we have a number then return that line.
 -- If is some text (a tag, maybe) then return
 -- the first line matching that text.
-getTask :: String -> IO Text.Text
-getTask str = do
-    tasks <- readLines taskFile
-    maybe
-        (return (getTaskByToken tasks str))
-        (getTaskByPosM tasks)
-        (Read.readMaybe str)
+getTask :: String -> [Text.Text] -> Either String Text.Text
+getTask str tasks = maybe
+    (getTaskByToken tasks str)
+    (getTaskByPos tasks)
+    (Read.readMaybe str)
 
 
 getCurrentTask :: [TimeEvent] -> Text.Text
 getCurrentTask [] = Text.empty
 getCurrentTask ts = snd (last ts)
+
+
+-- reverse the list and return the first item with a non-empty task
+getLastTask :: [TimeEvent] -> Text.Text
+getLastTask [] = Text.empty
+getLastTask ts = let t = filter (not . Text.null) . reverse . map snd $ ts in
+    if List.null t then Text.empty else head t
 
 
 getCurrentTaskTime :: [TimeEvent] -> Maybe LocalTime.ZonedTime
@@ -436,38 +438,49 @@ cmdDel str = do
     cmdList ""
 
 
+-- If the only arg is a number, assume it is a start time and restart the previous task.
 cmdIn :: [String] -> IO ()
 cmdIn [] = putStrLn "no task given"
-cmdIn [str] = doCommandIn str ""
+cmdIn [str] =
+    let n :: Maybe Int
+        n = Read.readMaybe str
+    in maybe (doCommandIn str "") (doCommandIn "" . show) n
 cmdIn (str:time:_) = doCommandIn str time
 
 
 doCommandIn :: String -> String -> IO ()
 doCommandIn str time = do
     (fp, ts) <- getCurrentTimesheet
-    task <- getTask str
+    tasks <- readLines taskFile
+    if List.null str
+    --let task = if List.null str then getLastTask ts else getTask str tasks
+
     if getCurrentTask ts == task
     then putStrLn "task already in progress"
     else do
-        now <- makeUserTime time
-        -- check timestamp is after last entry
-        let new = (now, task)
-        putStrLn ("start: " ++ Text.unpack task)
-        writeTimeSheet fp (ts ++ [new])
+        mbnow <- makeUserTime time
+        case mbnow of
+            Nothing -> putStrLn ("not a valid start time: " ++ time)
+            Just now -> do
+                -- FIXME check timestamp is after last entry
+                putStrLn ("start: " ++ Text.unpack task)
+                writeTimeSheet fp (ts ++ [(now, task)])
 
 
 cmdOut :: String -> IO ()
 cmdOut time = do
     (fp, ts) <- getCurrentTimesheet
-    -- We end the current task by writing an line with
+    -- We end the current task by writing a line with
     -- just the timestamp - no task.
     -- So if the last line (the current task) is already
     -- empty, don't do it again.
-    let task = getCurrentTask ts
-    putStrLn ("stop: " ++ Text.unpack task)
-    now <- makeUserTime time
-    either putStrLn (\new -> writeTimeSheet fp (ts ++ [new]))
-        (doCommandOut ts now)
+    mbnow <- makeUserTime time
+    case mbnow of
+        Nothing -> putStrLn ("end time not valid: " ++ time)
+        Just now -> do
+            let task = getCurrentTask ts
+            putStrLn ("stop: " ++ Text.unpack task)
+            either putStrLn (\new -> writeTimeSheet fp (ts ++ [new])) (doCommandOut ts now)
 
 
 doCommandOut :: [TimeEvent] -> LocalTime.ZonedTime -> Either String TimeEvent
