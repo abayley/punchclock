@@ -25,6 +25,7 @@ executable punchclock
     , directory
     , filepath
     , regex-compat
+    , split
     , text
     , time >= 1.5
   -- hs-source-dirs:

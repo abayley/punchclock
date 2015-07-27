@@ -3,10 +3,12 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 module Main where
 
+import qualified Control.Exception as Exception
 import qualified Control.Monad as Monad
 import qualified Data.Char as Char
 import qualified Data.Eq as Eq
 import qualified Data.List as List
+import qualified Data.List.Split as Split
 import qualified Data.Map.Strict as Map
 import qualified Data.Maybe as Maybe
 import qualified Data.Monoid as Monoid
@@ -21,6 +23,7 @@ import qualified Data.Text.IO as TextIO
 import qualified System.Directory as Dir
 import qualified System.Environment as Environment
 import qualified System.FilePath as FilePath
+import qualified System.IO.Error as IOError
 import qualified Text.Printf as Printf
 import qualified Text.Read as Read
 import qualified Text.Regex as Regex
@@ -56,6 +59,12 @@ rpad n str =
     str ++ replicate (n - List.length str) ' '
 
 
+-- remove chars from each end of a list (string)
+trim :: Eq a => [a] -> [a] -> [a]
+trim chars = dropChars . reverse . dropChars . reverse
+    where dropChars = List.dropWhile ((flip elem) chars)
+
+
 -- delete item n from a list
 removeItem :: Int -> [a] -> [a]
 removeItem n l = take (n-1) l ++ drop n l
@@ -89,16 +98,6 @@ dayformat :: String
 dayformat = "%F"
 
 
-timeDir :: FilePath
-timeDir = "./"
--- timeDir = "/c/Users/alistair/Documents/haskell/punchclock/"
--- timeDir = "/home/abayley/.todo/"
-
--- taskFile = "~/.timesheets/tasks.txt"
-taskFile :: String
-taskFile = timeDir ++ "todo.txt"
-
-
 readLines :: FilePath.FilePath -> IO [Text.Text]
 readLines filePath = do
     exist <- Dir.doesFileExist filePath
@@ -117,24 +116,106 @@ writeLines filePath t = TextIO.writeFile filePath (Text.unlines t)
 
 
 writeTimeSheet :: FilePath.FilePath -> [TimeEvent] -> IO ()
-writeTimeSheet filePath timeSheet = do
-    -- maybe (return ()) putStrLn (validate timeSheet)
+writeTimeSheet filePath timeSheet =
     writeLines filePath (map formatTimeEvent timeSheet)
 
 
-{-
+ensureFileExists :: FilePath.FilePath -> IO ()
+ensureFileExists filepath = do
+    exists <- Dir.doesFileExist filepath
+    Monad.unless exists (TextIO.writeFile filepath Text.empty)
+
+
+searchFiles :: [String] -> [FilePath] -> IO (Maybe FilePath)
+searchFiles files paths = do
+    let filepaths = [FilePath.combine p f | p <- paths, f <- files]
+    mbDirs <- Monad.forM filepaths $ \fp -> do
+        exists <- Dir.doesFileExist fp
+        if exists then return (Just fp) else return Nothing
+    return (case Maybe.catMaybes mbDirs of
+        [] -> Nothing
+        (h:_) -> Just h
+        )
+
+
+getEnvMaybe :: String -> IO (Maybe String)
 getEnvMaybe s =
+    Exception.catchJust
+        (\e -> if IOError.isDoesNotExistErrorType (IOError.ioeGetErrorType e) then Just () else Nothing)
+        (Environment.getEnv s >>= return . Just)
+        (\_ -> return Nothing)
+
+
+parseConfigVar :: Map.Map String String -> String -> Map.Map String String
+parseConfigVar m line =
+    let parts = Split.splitOn "=" line
+        key = head parts
+        value = trim " :=" (if List.length parts > 1 then head (drop 1 parts) else "")
+    in Map.insert key value m
+
+
+parseConfigLine :: Map.Map String String -> String -> Map.Map String String
+parseConfigLine m line =
+    case line of
+        [] -> m
+        ('#':_) -> m
+        _ | take 7 line == "export " -> parseConfigVar m (drop 7 line)
+          | otherwise -> parseConfigVar m line
+
+
+parseConfigFile :: FilePath.FilePath -> IO (Map.Map String String)
+parseConfigFile fp = do
+    ls <- readLines fp
+    return (List.foldl' parseConfigLine Map.empty (map Text.unpack ls))
+
+
+expandVars :: Map.Map String String -> String -> String
+expandVars m s =
+    -- Assumes only one var, at start of string.
+    -- Will keep expanding, so check length as a token
+    -- way to limit recursive expansion.
+    if elem '$' s && List.length s < 10000
+    then
+        let var = takeWhile (/= '/') . tail . dropWhile (/= '$') $ s
+            suffix = dropWhile (/= '/') s
+        in expandVars m (maybe s (++ suffix) (Map.lookup var m))
+    else s
+
+
+getTodoEnv :: IO (Map.Map String String)
+getTodoEnv = do
+    home <- Environment.getEnv "HOME"
+    let paths = [home, "."]
+    let files = ["todo.cfg", ".todo.cfg"]
+
+    mbTodoCfg <- getEnvMaybe "TODOTXT_CFG_FILE"
+    mbTodoCfgFp <- case mbTodoCfg of
+        Nothing -> searchFiles files paths
+        Just fp -> return (Just fp)
+    m <- case mbTodoCfgFp of
+        Nothing -> IOError.ioError (IOError.userError "Todo config file not found")
+        Just fp -> parseConfigFile fp
+    env <- Environment.getEnvironment
+    return (Map.union m (Map.fromList env))
+
+
+todoDirPath :: IO FilePath.FilePath
+todoDirPath = do
+    env <- getTodoEnv
+    return (maybe "./" (expandVars env) (Map.lookup "TODO_DIR" env))
 
 
 -- If the todo.cfg exists get the todo.txt path from it.
 -- If not, assume current dir.
 todoFilePath :: IO FilePath.FilePath
 todoFilePath = do
-    home = Environment.getEnv "HOME"
-    let paths = [home, "."]
-    let files = ["todo.cfg", ".todo.cfg"]
-    todoCfg = Environment.getEnv "TODOTXT_CFG_FILE"
--}
+    env <- getTodoEnv
+    return (maybe "./todo.txt" (expandVars env) (Map.lookup "TODO_FILE" env))
+
+
+dayPart :: LocalTime.ZonedTime -> Calendar.Day
+dayPart d = LocalTime.localDay (LocalTime.zonedTimeToLocalTime d)
+
 
 -- construct a ZonedTime from the current day plus user-supplied time
 makeUserTime :: String -> IO (Maybe LocalTime.ZonedTime)
@@ -145,28 +226,38 @@ makeUserTime str = do
     now <- LocalTime.getZonedTime
     let ds = List.filter Char.isDigit str
     let mbTod = FormatTime.parseTimeM True FormatTime.defaultTimeLocale "%H%M" ds
-    let day = LocalTime.localDay (LocalTime.zonedTimeToLocalTime now)
+    let day = dayPart now
     let newZT = now { LocalTime.zonedTimeToLocalTime = LocalTime.LocalTime day (Maybe.fromJust mbTod) }
     return (maybe Nothing (Just . const newZT) mbTod)
 
 
+dayOfWeek :: Calendar.Day -> Int
+dayOfWeek d =
+    let (_, _, n) = WeekDate.toWeekDate d in n
+
+
 timesheetStart :: Calendar.Day -> Calendar.Day
-timesheetStart today =
-    let (y, w, _) = WeekDate.toWeekDate today
+timesheetStart d =
+    let (y, w, _) = WeekDate.toWeekDate d
     in WeekDate.fromWeekDate y w 1
+
+
+sapTimesheetStart :: Calendar.Day -> Calendar.Day
+sapTimesheetStart d =
+    let (y, w, _) = WeekDate.toWeekDate (Calendar.addDays (-7) d)
+    in WeekDate.fromWeekDate y w 7
 
 
 currentTimesheetStart :: IO Calendar.Day
 currentTimesheetStart = do
     now <- LocalTime.getZonedTime
-    let today = LocalTime.localDay (LocalTime.zonedTimeToLocalTime now)
-    return (timesheetStart today)
+    return (timesheetStart (dayPart now))
 
 
-timesheetFilepath :: Calendar.Day -> String
-timesheetFilepath today =
+timesheetFilepath :: String -> Calendar.Day -> String
+timesheetFilepath dir today =
     let monday = timesheetStart today
-    in (timeDir ++ "timesheet-" ++ Calendar.showGregorian monday ++ ".txt")
+    in (dir ++ "/timesheet-" ++ Calendar.showGregorian monday ++ ".txt")
 
 
 parseTime :: String -> Maybe LocalTime.ZonedTime
@@ -193,6 +284,23 @@ parseTimesheet :: FilePath.FilePath -> IO [TimeEvent]
 parseTimesheet filePath = do
     lns <- readLines filePath
     return (map parseTimeEvent lns)
+
+
+-- SAP timesheet goes sunday -> monday, but our timesheets
+-- go monday -> sunday, so we need the current plus previous.
+sapTimesheets :: String -> Calendar.Day -> IO [TimeEvent]
+sapTimesheets dir date = do
+    let monday = timesheetStart date
+    let monday2 = Calendar.addDays (-7) monday
+    let monday3 = Calendar.addDays (7) monday
+    let sunday = Calendar.addDays (-1) monday
+    let t1Path = timesheetFilepath dir monday
+    let t2Path = timesheetFilepath dir monday2
+    lns1 <- readLines t1Path
+    lns2 <- readLines t2Path
+    let evs = (map parseTimeEvent (lns2 ++ lns1))
+    -- filter to just the week we want: sunday -> monday
+    return (filter (\(d, _) -> dayPart d <= monday3 && dayPart d >= sunday) evs)
 
 
 stripTaskPriority :: Text.Text -> Text.Text
@@ -250,7 +358,8 @@ getCurrentTaskTime ts = Just (fst (last ts))
 getCurrentTimesheet :: IO (String, [TimeEvent])
 getCurrentTimesheet = do
     monday <- currentTimesheetStart
-    let fp = timesheetFilepath monday
+    dir <- todoDirPath
+    let fp = timesheetFilepath dir monday
     ts <- parseTimesheet fp
     return (fp, ts)
 
@@ -272,8 +381,7 @@ timeentryDuration (start, end, _) = diifTimeToHours (diffZonedTime start end)
 
 
 timeentryDay :: TimeEntry -> Calendar.Day
-timeentryDay (start, _, _) =
-    LocalTime.localDay (LocalTime.zonedTimeToLocalTime start)
+timeentryDay (start, _, _) = dayPart start
 
 
 timeentryFormat :: TimeEntry -> String
@@ -311,16 +419,8 @@ accumTime keyf m te = Map.alter f (keyf te) m
 
 
 weekDays :: Calendar.Day -> [Calendar.Day]
-weekDays monday = map toEnum [start .. start+6]
-    where start = fromEnum monday
-
-
-printReportRow :: Calendar.Day -> String -> TimeSheetRow -> IO ()
-printReportRow monday code row = do
-    putStr ("\t\t" ++ code)
-    Monad.forM_ (weekDays monday) $ \d ->
-        putStr (maybe "\t." (Printf.printf "\t%.2f") (Map.lookup d row))
-    putStrLn ""
+weekDays start = map toEnum [d .. d+6]
+    where d = fromEnum start
 
 
 dayMonth :: Calendar.Day -> String
@@ -328,34 +428,67 @@ dayMonth date = let (_, m, d) = Calendar.toGregorian date
     in show d ++ "/" ++ show m
 
 
+printReportRow :: Calendar.Day -> String -> TimeSheetRow -> IO ()
+printReportRow start code row = do
+    putStr ("\t\t" ++ code ++ "\t\t\t\t\t")
+    Monad.forM_ (weekDays start) $ \d ->
+        putStr (maybe "\t" (Printf.printf "\t%.2f") (Map.lookup d row))
+    putStrLn ""
+
+
 printReport :: Calendar.Day -> TimeSheetTable -> IO ()
-printReport monday table = do
-    putStr "timesheet-code\t"
-    Monad.forM_ (weekDays monday) $ \d -> putStr ("\t" ++ dayMonth d)
+printReport start table = do
+    putStr "\t\ttimesheet-code\t\t\t\t\t"
+    Monad.forM_ (weekDays start) $ \d -> putStr ("\t" ++ dayMonth d)
     putStrLn ""
     Monad.mapM_
-        (uncurry (printReportRow monday))
+        (uncurry (printReportRow start))
         (List.sortBy (Ord.comparing fst) (Map.toList table))
-
-
-parseReportType :: String -> Maybe ReportType
-parseReportType ('t':_) = Just Task
-parseReportType ('c':_) = Just Code
-parseReportType _ = Nothing
 
 
 parseDay :: String -> Maybe Calendar.Day
 parseDay = FormatTime.parseTimeM True FormatTime.defaultTimeLocale dayformat
 
 
+-- Rules:
+-- SAP report:
+--  * date given: report week containing date
+--  * no date given: if today is monday or tuesday
+--    then report last week, otherwise report this week.
+-- Day report:
+--  * date given: report week containing date
+--  * no date given: report this week
+-- Task report:
+--  * date given: report week containing date
+--  * no date given: report this week
+parseReportArgs2 :: Calendar.Day -> String -> String -> (Calendar.Day, String)
+parseReportArgs2 today date timecode =
+    let parseDate d = timesheetStart (Maybe.fromJust (parseDay d))
+        monday = timesheetStart today
+    in case timecode of
+        ":day" -> if date == ""
+            then (monday, timecode)
+            else (parseDate date, timecode)
+        ":task"-> if date == ""
+            then (monday, timecode)
+            else (parseDate date, timecode)
+        _ -> if date == ""
+            then if dayOfWeek today `elem` [1,2]
+                then (sapTimesheetStart today, timecode)
+                else (monday, timecode)
+            else (parseDate date, timecode)
+
+
 parseReportArgs :: Calendar.Day -> [String] -> (Calendar.Day, String)
-parseReportArgs monday [] = (monday, "")
-parseReportArgs monday [a] = if isDate a
-    then (Maybe.fromJust (parseDay a), "")
-    else (monday, a)
-parseReportArgs monday (a:b:_) = if isDate a
-    then (Maybe.fromJust (parseDay a), b)
-    else (monday, a)
+parseReportArgs start [] = (start, "")
+parseReportArgs start [a] = if isDate a
+    then parseReportArgs2 start a ""
+    else parseReportArgs2 start "" a
+parseReportArgs start (a:b:_) = if isDate a
+    then parseReportArgs2 start a b
+    else if isDate b
+        then parseReportArgs2 start b a
+        else parseReportArgs2 start "" a
 
 
 -- validate:
@@ -391,7 +524,7 @@ doSapReport :: Calendar.Day -> String -> [TimeEntry] -> IO ()
 doSapReport start prefix ts = do
     let keyf = timeentryCodePrefix "no-code" prefix
     let table = List.foldl' (accumTime keyf) Map.empty ts
-    printReport start table
+    printReport (sapTimesheetStart start) table
 
 
 doTaskReport :: [TimeEntry] -> IO ()
@@ -426,13 +559,16 @@ doDayReport (d:ds) ts = do
 -- day: a line per entry: shows start, end, task. Header per day.
 doReport :: Calendar.Day -> String -> IO ()
 doReport start prefix = do
-    let fp = timesheetFilepath start
+    dir <- todoDirPath
+    let fp = timesheetFilepath dir start
     tevs <- parseTimesheet fp
     let ts = createTimeEntries tevs
     case prefix of
         ":day" -> doDayReport (weekDays start) ts
         ":task" -> doTaskReport ts
-        _ -> doSapReport start prefix ts
+        _ -> do
+            tevs2 <- sapTimesheets dir start
+            doSapReport start prefix (createTimeEntries tevs2)
 
 
 -----------------------------------------------------------
@@ -443,7 +579,14 @@ doReport start prefix = do
 
 cmdList :: String -> IO ()
 cmdList str = do
-    tasks <- readLines taskFile
+    todoFile <- todoFilePath
+    -- ensureFileExists todoFile
+    tasks <- readLines todoFile
+    listTasks str tasks
+
+
+listTasks :: String -> [Text.Text] -> IO ()
+listTasks str tasks = do
     let nats :: [Int]
         nats = [1..]
     let nTasks = [Text.append (Text.pack (rpad 3 (show n) ++ " ")) l | (n, l) <- zip nats tasks]
@@ -458,20 +601,24 @@ cmdAdd task =
     if List.null task
     then putStrLn "no task given"
     else do
-        tasks <- readLines taskFile
-        writeLines taskFile (List.sort (Text.pack task : tasks))
-        cmdList ""
+        todoFile <- todoFilePath
+        -- ensureFileExists todoFile
+        tasks <- readLines todoFile
+        writeLines todoFile (List.sort (Text.pack task : tasks))
+        listTasks "" tasks
 
 
 cmdDel :: String -> IO ()
 cmdDel str = do
+    todoFile <- todoFilePath
+    -- ensureFileExists todoFile
+    tasks <- readLines todoFile
     let n = maybe 0 id (Read.readMaybe str)
-    lns <- readLines taskFile
-    if (n > 0 && n <= List.length lns)
+    if (n > 0 && n <= List.length tasks)
     then do
-        writeLines taskFile (removeItem n lns)
-        cmdList ""
-    else putStrLn ("task index " ++ (show n) ++ " out of range (1-" ++ show (List.length lns) ++ ")")
+        writeLines todoFile (removeItem n tasks)
+        listTasks "" tasks
+    else putStrLn ("task index " ++ (show n) ++ " out of range (1-" ++ show (List.length tasks) ++ ")")
 
 
 -- why can't I used \\d for digit? argh
@@ -500,7 +647,8 @@ cmdIn (str1:str2:_) = if isTime str1
 doCommandIn :: String -> String -> IO ()
 doCommandIn str time = do
     (fp, ts) <- getCurrentTimesheet
-    tasks <- readLines taskFile
+    todoFile <- todoFilePath
+    tasks <- readLines todoFile
     mbnow <- makeUserTime time
     let ete = doIn2 str time ts tasks mbnow
     case ete of
@@ -575,31 +723,43 @@ cmdCurrent _ = do
 cmdValidate :: String -> IO ()
 cmdValidate str = do
     start <- maybe currentTimesheetStart return (parseDay str)
-    let fp = timesheetFilepath start
+    dir <- todoDirPath
+    let fp = timesheetFilepath dir start
     ts <- parseTimesheet fp
     maybe (putStrLn (fp ++ " ok")) putStrLn (validate ts)
 
 
 cmdReport :: [String] -> IO ()
 cmdReport args = do
-    monday <- currentTimesheetStart
-    (uncurry doReport) (parseReportArgs monday args)
+    now <- LocalTime.getZonedTime
+    let today = dayPart now
+    (uncurry doReport) (parseReportArgs today args)
 
 
 -----------------------------------------------------------
 -- Main
 
 usage :: String -> IO ()
-usage cmd = do
-    putStrLn "usage: "
-    putStrLn "  add <task>"
-    putStrLn "  ls <text>"
-    putStrLn "  del <n>"
-    putStrLn "  in <n>|<task>"
-    putStrLn "  out <time>"
-    putStrLn "  current"
-    putStrLn "  report <date> :day|:task|<timecode-prefix>"
-    putStrLn "  validate <date>"
+usage cmd = case cmd of
+    ('r':_) -> Monad.mapM_ putStrLn (
+        "usage: report <date> :day|:task|<timecode-prefix>" :
+        "" :
+        "Emits a report. Layout and analysis depend on args:" :
+        "  :day : detailed list of weeks's tasks with start and end times and durations" :
+        "  :task : summary of hours spend per task for the week" :
+        "  <prefix> : SAP timesheet. Line per timecode, column per day of week. Timecodes are identified by prefix." :
+        [])
+    _ -> Monad.mapM_ putStrLn (
+        "usage: " :
+        "  add <task>" :
+        "  ls <text>" :
+        "  del <n>" :
+        "  in <n>|<task>" :
+        "  out <time>" :
+        "  current" :
+        "  report <date> :day|:task|<timecode-prefix>" :
+        "  validate <date>" :
+        [])
 
 
 main :: IO Int
