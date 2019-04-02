@@ -35,14 +35,12 @@ store tasks in ~/.todo/todo.txt
 
 I recommend that the task list is in todo.txt format:
   https://github.com/ginatrapani/todo.txt-cli/wiki/The-Todo.txt-Format
-but this is not required (we just copy the entire task to
-the timesheet).
-It is likely to make reporting easier
-e.g producing a summary by project.
+but this is not required (we just copy the entire task to the timesheet).
+It is likely to make reporting easier e.g producing a summary by project.
 -}
 
 
--- Utilities and a coupld of orphan instances
+-- Utilities and a couple of orphan instances
 -- that will be useful later.
 
 headMaybe :: [a] -> Maybe a
@@ -71,11 +69,11 @@ removeItem n l = take (n-1) l ++ drop n l
 
 
 instance Eq.Eq LocalTime.ZonedTime where
-    (==) a b = (==) (LocalTime.zonedTimeToUTC a)  (LocalTime.zonedTimeToUTC b)
+    (==) a b = (==) (LocalTime.zonedTimeToUTC a) (LocalTime.zonedTimeToUTC b)
 
 
 instance Ord.Ord LocalTime.ZonedTime where
-    compare a b = compare (LocalTime.zonedTimeToUTC a)  (LocalTime.zonedTimeToUTC b)
+    compare a b = compare (LocalTime.zonedTimeToUTC a) (LocalTime.zonedTimeToUTC b)
 
 
 -- A single timed event.
@@ -118,12 +116,6 @@ writeLines filePath t = TextIO.writeFile filePath (Text.unlines t)
 writeTimeSheet :: FilePath.FilePath -> [TimeEvent] -> IO ()
 writeTimeSheet filePath timeSheet =
     writeLines filePath (map formatTimeEvent timeSheet)
-
-
-ensureFileExists :: FilePath.FilePath -> IO ()
-ensureFileExists filepath = do
-    exists <- Dir.doesFileExist filepath
-    Monad.unless exists (TextIO.writeFile filepath Text.empty)
 
 
 searchFiles :: [String] -> [FilePath] -> IO (Maybe FilePath)
@@ -178,19 +170,22 @@ expandVars m s =
     then
         let var = takeWhile (/= '/') . tail . dropWhile (/= '$') $ s
             suffix = dropWhile (/= '/') s
-        in expandVars m (maybe s (++ suffix) (Map.lookup var m))
+        -- If we don't find the var in the map, replace with nothing i.e. just the suffix.
+        in expandVars m (maybe suffix (++ suffix) (Map.lookup var m))
     else s
 
 
 getTodoEnv :: IO (Map.Map String String)
 getTodoEnv = do
-    home <- Environment.getEnv "HOME"
-    let paths = [home, "."]
-    let files = ["todo.cfg", ".todo.cfg"]
-
     mbTodoCfg <- getEnvMaybe "TODOTXT_CFG_FILE"
     mbTodoCfgFp <- case mbTodoCfg of
-        Nothing -> searchFiles files paths
+        Nothing -> do
+            -- If HOME is undefined this will throw an exception.
+            -- Probably what we want.
+            home <- Environment.getEnv "HOME"
+            let paths = [home, "."]
+            let files = ["todo.cfg", ".todo.cfg"]
+            searchFiles files paths
         Just fp -> return (Just fp)
     m <- case mbTodoCfgFp of
         Nothing -> IOError.ioError (IOError.userError "Todo config file not found")
@@ -372,12 +367,12 @@ diffZonedTime :: LocalTime.ZonedTime -> LocalTime.ZonedTime -> Clock.NominalDiff
 diffZonedTime start end = Clock.diffUTCTime (LocalTime.zonedTimeToUTC end) (LocalTime.zonedTimeToUTC start)
 
 
-diifTimeToHours :: Clock.NominalDiffTime -> Double
-diifTimeToHours i = fromRational (toRational i) / 3600
+diffTimeToHours :: Clock.NominalDiffTime -> Double
+diffTimeToHours i = fromRational (toRational i) / 3600
 
 
 timeentryDuration :: TimeEntry -> Double
-timeentryDuration (start, end, _) = diifTimeToHours (diffZonedTime start end)
+timeentryDuration (start, end, _) = diffTimeToHours (diffZonedTime start end)
 
 
 timeentryDay :: TimeEntry -> Calendar.Day
@@ -430,7 +425,7 @@ dayMonth date = let (_, m, d) = Calendar.toGregorian date
 
 printReportRow :: Calendar.Day -> String -> TimeSheetRow -> IO ()
 printReportRow start code row = do
-    putStr ("\t\t" ++ code ++ "\t\t\t\t\t")
+    putStr ("\t\t" ++ code ++ "\t\t\t\t")
     Monad.forM_ (weekDays start) $ \d ->
         putStr (maybe "\t" (Printf.printf "\t%.2f") (Map.lookup d row))
     putStrLn ""
@@ -438,7 +433,7 @@ printReportRow start code row = do
 
 printReport :: Calendar.Day -> TimeSheetTable -> IO ()
 printReport start table = do
-    putStr "\t\ttimesheet-code\t\t\t\t\t"
+    putStr "\t\ttimesheet-code\t\t\t\t"
     Monad.forM_ (weekDays start) $ \d -> putStr ("\t" ++ dayMonth d)
     putStrLn ""
     Monad.mapM_
@@ -539,19 +534,20 @@ doTaskReport ts = do
         f l = (snd (head l), sum (List.map fst l))
     let sums = List.map f groups
     Monad.forM_ sums $ \(task, total) ->
-        putStrLn ((Printf.printf "%6.2f" total) ++ "  " ++ Text.unpack task)
+        putStrLn ((Printf.printf "%6.2f  " total) ++ Text.unpack task)
 
 
-doDayReport :: [Calendar.Day] -> [TimeEntry] -> IO ()
-doDayReport [] _ = return ()
-doDayReport (d:ds) ts = do
+doDayReport :: [Calendar.Day] -> [TimeEntry] -> Double -> IO ()
+doDayReport [] _ week = putStrLn (Printf.printf "               %5.2f" week)
+doDayReport (d:ds) ts week = do
     let todays = filter ((d ==) . timeentryDay) ts
+    let total = sum (map timeentryDuration todays)
     Monad.when (not (List.null todays)) (do
-        putStrLn (show d)
-        Monad.mapM_ (putStrLn .timeentryFormat) todays
+        putStrLn (show d ++ Printf.printf "     %5.2f  (total)" total)
+        Monad.mapM_ (putStrLn . timeentryFormat) todays
         putStrLn ""
         )
-    doDayReport ds ts
+    doDayReport ds ts (week + total)
 
 
 -- SAP: a line per code, a column for each day
@@ -564,7 +560,7 @@ doReport start prefix = do
     tevs <- parseTimesheet fp
     let ts = createTimeEntries tevs
     case prefix of
-        ":day" -> doDayReport (weekDays start) ts
+        ":day" -> doDayReport (weekDays start) ts 0
         ":task" -> doTaskReport ts
         _ -> do
             tevs2 <- sapTimesheets dir start
@@ -580,7 +576,6 @@ doReport start prefix = do
 cmdList :: String -> IO ()
 cmdList str = do
     todoFile <- todoFilePath
-    -- ensureFileExists todoFile
     tasks <- readLines todoFile
     listTasks str tasks
 
@@ -602,7 +597,6 @@ cmdAdd task =
     then putStrLn "no task given"
     else do
         todoFile <- todoFilePath
-        -- ensureFileExists todoFile
         tasks <- readLines todoFile
         writeLines todoFile (List.sort (Text.pack task : tasks))
         listTasks "" tasks
@@ -611,7 +605,6 @@ cmdAdd task =
 cmdDel :: String -> IO ()
 cmdDel str = do
     todoFile <- todoFilePath
-    -- ensureFileExists todoFile
     tasks <- readLines todoFile
     let n = maybe 0 id (Read.readMaybe str)
     if (n > 0 && n <= List.length tasks)
